@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+.env
+.env.local
+.env.production
+
+# Logs
+*.log
+logs/
+
+# Static / uploads (generated at runtime)
+static/avatars/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Backup files
+*.bak
+
+# Docker
+*.tar
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
