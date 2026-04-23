@@ -1,0 +1,47 @@
+# Never bake secrets, git history, or dev scaffolding into the image
+.env
+.env.*
+.git/
+.gitignore
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local runtime/state
+static/avatars/
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.bak
+*.swp
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+.claude/
+
+# Tests and docs — keep them in the repo, out of the image
+.pytest_cache/
+.coverage
+htmlcov/
+DEPLOY.md
+README.md
+
+# Private keys — must never end up in an image
+*.pem
+*.key
+
+# Ops scripts (not needed inside the container)
+build-and-push.sh
+deploy.sh
+redeploy.sh
+test_evmars.sh
+docker-compose*.yml

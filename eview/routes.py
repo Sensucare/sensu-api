@@ -211,6 +211,27 @@ async def unlink_device(device_id: str, current_user: Dict = Depends(get_current
         raise HTTPException(status_code=500, detail="Failed to unlink device")
 
 
+def _merge_live_online(status: Dict, device_id: str) -> Dict:
+    """
+    The DB-backed get_device_status only persists ALARM events, so between
+    alarms a live device looks "offline" even though it is heart-beating every
+    minute. Merge in the MQTT service's per-device last-seen (which is updated
+    by every event including trackerRealTime) so the flag tracks reality.
+    """
+    import time as _time
+    mqtt_svc = get_eview_mqtt_service()
+    if not mqtt_svc:
+        return status
+    last_seen_epoch = mqtt_svc.get_device_last_seen(device_id)
+    if last_seen_epoch is None:
+        return status
+    age_min = (_time.time() - last_seen_epoch) / 60.0
+    if age_min < 10:
+        status["online"] = True
+        status["last_seen_source"] = "mqtt_live"
+    return status
+
+
 @router.get("/api/eview/{device_id}/status", tags=["eview"], summary="Get Eview device status", response_model=EviewStatus)
 async def get_eview_status(device_id: str, current_user: Dict = Depends(get_current_user)):
     """Get current status of an Eview button device."""
@@ -220,9 +241,15 @@ async def get_eview_status(device_id: str, current_user: Dict = Depends(get_curr
 
         status = await get_eview_event_manager().get_device_status(device_id)
         if not status:
+            # Even with no persisted events, a live heartbeat means the device is on.
+            import time as _time
+            mqtt_svc = get_eview_mqtt_service()
+            last_seen_epoch = mqtt_svc.get_device_last_seen(device_id) if mqtt_svc else None
+            if last_seen_epoch is not None and (_time.time() - last_seen_epoch) / 60.0 < 10:
+                return EviewStatus(device_id=device_id, online=True)
             return EviewStatus(device_id=device_id)
 
-        return status
+        return _merge_live_online(status, device_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -311,6 +338,16 @@ async def get_eview_realtime(device_id: str, current_user: Dict = Depends(get_cu
         # Structure: {'message': 'success', 'result': {'generalData': {...}, 'latestLocation': {...}}}
         mqtt_status = await get_eview_event_manager().get_device_status(device_id)
         is_online = bool(mqtt_status.get("online", False)) if mqtt_status else False
+
+        # Fold in live heartbeats from the MQTT listener (trackerRealTime is
+        # not persisted to EviewEvent, so the DB-only check shows false-offline
+        # for a device that is actively heart-beating between alarms).
+        if not is_online:
+            import time as _time
+            mqtt_svc = get_eview_mqtt_service()
+            last_seen_epoch = mqtt_svc.get_device_last_seen(device_id) if mqtt_svc else None
+            if last_seen_epoch is not None and (_time.time() - last_seen_epoch) / 60.0 < 10:
+                is_online = True
 
         result = evmars_data.get('result', {})
         general_data = result.get('generalData', {})

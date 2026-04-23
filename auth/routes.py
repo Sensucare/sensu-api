@@ -8,7 +8,7 @@ from typing import Dict, Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from auth.core import PasswordManager, JWTManager, get_current_user
 from auth.models import (
@@ -103,20 +103,82 @@ def get_user_manager():
     return user_manager
 
 
+# Map client-facing values to the Postgres enum labels defined in Prisma.
+# Keep the DB enum labels as pass-through so clients that already send
+# the canonical form continue to work.
+_BLOOD_TYPE_ALIASES = {
+    "A+": "A_POSITIVE",   "A-": "A_NEGATIVE",
+    "B+": "B_POSITIVE",   "B-": "B_NEGATIVE",
+    "AB+": "AB_POSITIVE", "AB-": "AB_NEGATIVE",
+    "O+": "O_POSITIVE",   "O-": "O_NEGATIVE",
+    "UNKNOWN": "UNKNOWN",
+}
+_BLOOD_TYPE_CANONICAL = set(_BLOOD_TYPE_ALIASES.values())
+
+# Gender enum accepts English, Spanish, and the canonical DB label.
+_GENDER_ALIASES = {
+    "male": "HOMBRE",   "man": "HOMBRE",   "m": "HOMBRE",
+    "hombre": "HOMBRE",
+    "female": "MUJER",  "woman": "MUJER",  "f": "MUJER",
+    "mujer": "MUJER",
+    "other": "OTRO",    "o": "OTRO",
+    "otro": "OTRO",
+}
+_GENDER_CANONICAL = {"HOMBRE", "MUJER", "OTRO"}
+
+
 class UpdateProfileRequest(BaseModel):
+    # Symmetric naming: requests can use either the short form (height/weight)
+    # or the long form (height_cm/weight_kg) returned by GET /api/auth/me.
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
     full_name: Optional[str] = None
     phone_number: Optional[str] = None
     date_of_birth: Optional[str] = None
     gender: Optional[str] = None
     blood_type: Optional[str] = None
-    height: Optional[float] = None
-    weight: Optional[float] = None
+    height: Optional[float] = Field(default=None, alias="height_cm")
+    weight: Optional[float] = Field(default=None, alias="weight_kg")
     medical_conditions: Optional[list] = None
     medications: Optional[list] = None
     profile_image_url: Optional[str] = None
     address: Optional[str] = None
     emergency_contact_name: Optional[str] = None
     emergency_contact_phone: Optional[str] = None
+
+    @field_validator("blood_type", mode="before")
+    @classmethod
+    def _normalize_blood_type(cls, v):
+        if v is None or v == "":
+            return None
+        if not isinstance(v, str):
+            raise ValueError("blood_type must be a string")
+        s = v.strip()
+        if s.upper() in _BLOOD_TYPE_CANONICAL:
+            return s.upper()
+        mapped = _BLOOD_TYPE_ALIASES.get(s.upper())
+        if mapped:
+            return mapped
+        raise ValueError(
+            f"Invalid blood_type '{v}'. Accepted: A+, A-, B+, B-, AB+, AB-, O+, O-, UNKNOWN"
+        )
+
+    @field_validator("gender", mode="before")
+    @classmethod
+    def _normalize_gender(cls, v):
+        if v is None or v == "":
+            return None
+        if not isinstance(v, str):
+            raise ValueError("gender must be a string")
+        s = v.strip()
+        if s.upper() in _GENDER_CANONICAL:
+            return s.upper()
+        mapped = _GENDER_ALIASES.get(s.lower())
+        if mapped:
+            return mapped
+        raise ValueError(
+            f"Invalid gender '{v}'. Accepted: HOMBRE, MUJER, OTRO (or their English equivalents)"
+        )
 
 
 @router.post("/api/auth/signup", tags=["auth"], summary="Create a new user account", response_model=LoginResponse)

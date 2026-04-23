@@ -125,6 +125,13 @@ class EviewMQTTService:
         self._last_event_device: Optional[str] = None
         self._stats_last_reset = time.time()
         self._health_interval = 300  # 5 minutes
+        # Per-device last-seen (monotonic seconds since epoch).
+        # Updated on EVERY MQTT message including high-frequency trackerRealTime
+        # heartbeats — used by the /status and /realtime routes to tell whether
+        # a device is actually online, because only alarms get persisted to the
+        # EviewEvent table and the DB-only check shows false-offline between alarms.
+        self._last_seen_lock = threading.Lock()
+        self._last_seen_per_device: Dict[str, float] = {}
 
     def add_device(self, device_id: str) -> None:
         """Add a device to monitor."""
@@ -376,6 +383,10 @@ class EviewMQTTService:
 
         with self._stats_lock:
             self._last_event_device = device_id
+
+        # Record per-device last-seen for every event (including heartbeats).
+        with self._last_seen_lock:
+            self._last_seen_per_device[device_id] = time.time()
 
         logger.info(
             f"Event: {event_type} | Device: {device_name} ({device_id}) | "
@@ -675,6 +686,16 @@ class EviewMQTTService:
                 "last_event": last_event_ago,
                 "last_event_device": self._last_event_device,
             }
+
+    def get_device_last_seen(self, device_id: str) -> Optional[float]:
+        """
+        Return the wall-clock time (seconds since epoch) at which we last
+        received any MQTT message from this device, or None if we have not
+        seen it since the service started. Updated on every event including
+        trackerRealTime heartbeats that are not persisted to the DB.
+        """
+        with self._last_seen_lock:
+            return self._last_seen_per_device.get(device_id)
 
 
 # Singleton instance for use across the application
