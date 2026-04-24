@@ -239,18 +239,25 @@ class EviewMQTTService:
             self._stats_last_reset = time.time()
 
     def _subscribe_to_device(self, device_id: str) -> None:
-        """Subscribe to MQTT topics for a specific device."""
+        """
+        Subscribe to every MQTT message this device publishes.
+
+        We use a multi-level wildcard (#) rather than enumerating specific
+        event names because the device emits several message types the app
+        cares about — alarms, trackerRealTime, and heartbeat/property reports
+        on separate subtrees. Missing heartbeats was the cause of the online
+        badge flapping: the app only ever saw online while a GPS fix was
+        arriving.
+
+        The on_message handler parses the topic and handles unknown event
+        types gracefully, so this is safe to broaden.
+        """
         if not self.client:
             return
 
-        topics = [
-            f"/device/{self.product_id}/{device_id}/message/event/trackerAlarm",
-            f"/device/{self.product_id}/{device_id}/message/event/trackerRealTime",
-        ]
-
-        for topic in topics:
-            self.client.subscribe(topic, qos=1)
-            logger.debug(f"Subscribed to device topic: {topic}")
+        topic = f"/device/{self.product_id}/{device_id}/message/#"
+        self.client.subscribe(topic, qos=1)
+        logger.debug(f"Subscribed to device topic: {topic}")
 
     def _subscribe_to_all_devices(self) -> None:
         """Subscribe to topics for all monitored devices."""
@@ -258,13 +265,11 @@ class EviewMQTTService:
             for device_id in self._monitored_devices:
                 self._subscribe_to_device(device_id)
 
-        # Also subscribe to wildcard topics for any device
+        # Broad wildcards so we catch any device's messages including heartbeats.
         if self.client:
             wildcard_topics = [
-                f"/device/{self.product_id}/+/message/event/trackerAlarm",
-                f"/device/{self.product_id}/+/message/event/trackerRealTime",
-                "/device/*/*/message/event/trackerAlarm",
-                "/device/*/*/message/event/trackerRealTime",
+                f"/device/{self.product_id}/+/message/#",
+                "/device/+/+/message/#",
             ]
             for topic in wildcard_topics:
                 self.client.subscribe(topic, qos=1)
