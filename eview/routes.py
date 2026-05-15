@@ -214,21 +214,33 @@ async def unlink_device(device_id: str, current_user: Dict = Depends(get_current
 def _merge_live_online(status: Dict, device_id: str) -> Dict:
     """
     The DB-backed get_device_status only persists ALARM events, so between
-    alarms a live device looks "offline" even though it is heart-beating every
-    minute. Merge in the MQTT service's per-device last-seen (which is updated
-    by every event including trackerRealTime) so the flag tracks reality.
+    alarms a live device looks "offline" — and its battery / location
+    appear frozen on whatever the last alarm carried (for a freshly
+    activated device, that is the 100 % registration event). Merge in
+    the MQTT service's in-memory live state (last-seen + battery / lat
+    / lng, updated by every event including trackerRealTime) so the
+    surface reflects what the device is actually reporting right now.
     """
     import time as _time
     mqtt_svc = get_eview_mqtt_service()
     if not mqtt_svc:
         return status
     last_seen_epoch = mqtt_svc.get_device_last_seen(device_id)
-    if last_seen_epoch is None:
-        return status
-    age_min = (_time.time() - last_seen_epoch) / 60.0
-    if age_min < 10:
-        status["online"] = True
-        status["last_seen_source"] = "mqtt_live"
+    if last_seen_epoch is not None:
+        age_min = (_time.time() - last_seen_epoch) / 60.0
+        if age_min < 10:
+            status["online"] = True
+            status["last_seen_source"] = "mqtt_live"
+    live = mqtt_svc.get_device_live_state(device_id)
+    if live:
+        # Prefer the live MQTT cache over the alarm row for fast-moving
+        # telemetry. Alarm rows are still authoritative for everything
+        # else (event_type, alarm_code, history).
+        if live.get('battery') is not None:
+            status['battery'] = live['battery']
+        if live.get('lat') is not None and live.get('lng') is not None:
+            status['latitude'] = live['lat']
+            status['longitude'] = live['lng']
     return status
 
 
@@ -241,13 +253,25 @@ async def get_eview_status(device_id: str, current_user: Dict = Depends(get_curr
 
         status = await get_eview_event_manager().get_device_status(device_id)
         if not status:
-            # Even with no persisted events, a live heartbeat means the device is on.
+            # Even with no persisted events, a live heartbeat means the
+            # device is on AND we may have its latest battery / location
+            # cached from the MQTT subscriber. Surface those so a freshly
+            # registered device shows real telemetry instead of nulls.
             import time as _time
             mqtt_svc = get_eview_mqtt_service()
             last_seen_epoch = mqtt_svc.get_device_last_seen(device_id) if mqtt_svc else None
-            if last_seen_epoch is not None and (_time.time() - last_seen_epoch) / 60.0 < 10:
-                return EviewStatus(device_id=device_id, online=True)
-            return EviewStatus(device_id=device_id)
+            live = mqtt_svc.get_device_live_state(device_id) if mqtt_svc else None
+            online = (
+                last_seen_epoch is not None
+                and (_time.time() - last_seen_epoch) / 60.0 < 10
+            )
+            return EviewStatus(
+                device_id=device_id,
+                online=online,
+                battery=(live or {}).get('battery'),
+                latitude=(live or {}).get('lat'),
+                longitude=(live or {}).get('lng'),
+            )
 
         return _merge_live_online(status, device_id)
     except HTTPException:

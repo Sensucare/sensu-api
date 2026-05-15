@@ -130,8 +130,17 @@ class EviewMQTTService:
         # heartbeats — used by the /status and /realtime routes to tell whether
         # a device is actually online, because only alarms get persisted to the
         # EviewEvent table and the DB-only check shows false-offline between alarms.
+        #
+        # `_live_state_per_device` extends the same idea: it keeps the latest
+        # battery / lat / lng we have ever received from the device, alarm or
+        # heartbeat alike. /api/eview/<id>/status merges these into the DB-backed
+        # response so the mobile app shows live readings instead of the frozen
+        # value from the device's last alarm (which for fresh devices is the
+        # 100 % registration event). EviewEvent rows are still alarms-only —
+        # we deliberately don't bloat that table with every minute heartbeat.
         self._last_seen_lock = threading.Lock()
         self._last_seen_per_device: Dict[str, float] = {}
+        self._live_state_per_device: Dict[str, Dict[str, Any]] = {}
 
     def add_device(self, device_id: str) -> None:
         """Add a device to monitor."""
@@ -390,8 +399,19 @@ class EviewMQTTService:
             self._last_event_device = device_id
 
         # Record per-device last-seen for every event (including heartbeats).
+        # Also record the latest live state (battery / lat / lng) so the
+        # /status endpoint can surface fresh telemetry between alarm rows.
         with self._last_seen_lock:
-            self._last_seen_per_device[device_id] = time.time()
+            now_epoch = time.time()
+            self._last_seen_per_device[device_id] = now_epoch
+            entry = self._live_state_per_device.setdefault(device_id, {})
+            if battery is not None:
+                entry['battery'] = battery
+                entry['battery_updated_at'] = now_epoch
+            if lat is not None and lng is not None:
+                entry['lat'] = lat
+                entry['lng'] = lng
+                entry['location_updated_at'] = now_epoch
 
         logger.info(
             f"Event: {event_type} | Device: {device_name} ({device_id}) | "
@@ -701,6 +721,17 @@ class EviewMQTTService:
         """
         with self._last_seen_lock:
             return self._last_seen_per_device.get(device_id)
+
+    def get_device_live_state(self, device_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Return the latest battery / lat / lng observed for this device,
+        captured from every MQTT message (alarms + heartbeats). Returns a
+        copy of the cached dict so callers can mutate freely; returns
+        None if we have not seen the device since service start.
+        """
+        with self._last_seen_lock:
+            entry = self._live_state_per_device.get(device_id)
+            return dict(entry) if entry else None
 
 
 # Singleton instance for use across the application
