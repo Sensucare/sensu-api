@@ -183,6 +183,7 @@ class UpdateProfileRequest(BaseModel):
 
 @router.post("/api/auth/signup", tags=["auth"], summary="Create a new user account", response_model=LoginResponse)
 async def signup(body: SignupWithImeiRequest):
+    email_for_log = (body.email or "").strip().lower() or "<missing>"
     password_hash = PasswordManager.hash_password(body.password)
 
     # Validate IMEI exists in the Device table before creating account
@@ -198,6 +199,7 @@ async def signup(body: SignupWithImeiRequest):
 
     if existing:
         if existing.get("isActive", True):
+            logger.info(f"signup_attempt email={email_for_log} result=email_already_registered")
             raise HTTPException(status_code=400, detail="Email already registered")
         # Inactive account — reactivate it with the new credentials
         try:
@@ -209,6 +211,7 @@ async def signup(body: SignupWithImeiRequest):
             token_data = {"user_id": existing["id"], "username": body.username}
             access_token = JWTManager.create_access_token(token_data)
             refresh_token = JWTManager.create_refresh_token(token_data)
+            logger.info(f"signup_attempt email={email_for_log} user_id={existing['id']} result=reactivated")
             return LoginResponse(
                 access_token=access_token,
                 refresh_token=refresh_token,
@@ -252,6 +255,7 @@ async def signup(body: SignupWithImeiRequest):
             except Exception as link_err:
                 logger.warning(f"Device link failed after signup for {user_id}: {link_err}")
 
+        logger.info(f"signup_attempt email={email_for_log} user_id={user_id} result=created")
         return LoginResponse(
             access_token=access_token,
             refresh_token=refresh_token,
@@ -265,15 +269,19 @@ async def signup(body: SignupWithImeiRequest):
 
 @router.post("/api/auth/login", tags=["auth"], summary="Login to get JWT token", response_model=LoginResponse)
 async def login(body: LoginRequest):
+    email_for_log = (body.email or "").strip().lower() or "<missing>"
     user = await get_user_manager().get_user_by_email(body.email)
 
     if not user:
+        logger.info(f"login_attempt email={email_for_log} result=user_not_found")
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if not PasswordManager.verify_password(body.password, user["passwordHash"]):
+        logger.info(f"login_attempt email={email_for_log} user_id={user['id']} result=wrong_password")
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if not user.get("isActive", True):
+        logger.info(f"login_attempt email={email_for_log} user_id={user['id']} result=disabled")
         raise HTTPException(status_code=403, detail="User account is disabled")
 
     token_data = {"user_id": user["id"], "username": user["username"]}
@@ -281,6 +289,8 @@ async def login(body: LoginRequest):
     refresh_token = JWTManager.create_refresh_token(token_data)
 
     await get_user_manager().update_last_login(user["id"])
+
+    logger.info(f"login_attempt email={email_for_log} user_id={user['id']} result=ok")
 
     return LoginResponse(
         access_token=access_token,

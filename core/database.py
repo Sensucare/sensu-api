@@ -98,6 +98,19 @@ def _records_to_list(records: List[asyncpg.Record]) -> List[Dict[str, Any]]:
     return [dict(r) for r in records]
 
 
+def _normalize_email(email: Optional[str]) -> Optional[str]:
+    """Normalize email for storage and lookup: trim whitespace, lowercase.
+
+    Mobile keyboards routinely auto-capitalize the first letter of an email
+    field and add trailing spaces on tap-to-next, so registration and login
+    can disagree on the canonical form. Normalizing here is the single
+    source of truth for every code path that touches an email."""
+    if email is None:
+        return None
+    normalized = email.strip().lower()
+    return normalized or None
+
+
 class UserManager:
     """Manager for user authentication and device management.
 
@@ -128,12 +141,14 @@ class UserManager:
             medical_conditions = profile_data.get('medical_conditions')
             medications = profile_data.get('medications')
 
+        normalized_email = _normalize_email(email)
+
         await self.db.execute('''
             INSERT INTO "User" (id, username, email, "passwordHash", "isActive",
                                "fullName", phone, "medicalConditions", medications,
                                "createdAt", "updatedAt")
             VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $9)
-        ''', user_id, username, email, password_hash, full_name, phone,
+        ''', user_id, username, normalized_email, password_hash, full_name, phone,
             json.dumps(medical_conditions) if medical_conditions else None,
             json.dumps(medications) if medications else None,
             now)
@@ -150,10 +165,13 @@ class UserManager:
         return _record_to_dict(row)
 
     async def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
-        """Get user by email."""
+        """Get user by email. Normalizes input so casing/whitespace can't desync it from storage."""
+        normalized_email = _normalize_email(email)
+        if normalized_email is None:
+            return None
         row = await self.db.fetchrow(
-            'SELECT * FROM "User" WHERE email = $1',
-            email
+            'SELECT * FROM "User" WHERE LOWER(email) = $1',
+            normalized_email
         )
         return _record_to_dict(row)
 
@@ -214,10 +232,13 @@ class UserManager:
         return count > 0
 
     async def email_exists(self, email: str) -> bool:
-        """Check if email exists."""
+        """Check if email exists. Same normalization as get_user_by_email."""
+        normalized_email = _normalize_email(email)
+        if normalized_email is None:
+            return False
         count = await self.db.fetchval(
-            'SELECT COUNT(*) FROM "User" WHERE email = $1',
-            email
+            'SELECT COUNT(*) FROM "User" WHERE LOWER(email) = $1',
+            normalized_email
         )
         return count > 0
 
@@ -462,6 +483,7 @@ class EviewEventManager:
         now = datetime.datetime.utcnow()
         dedup_cutoff = now - datetime.timedelta(seconds=self.DEDUP_WINDOW_SECONDS)
 
+        event_id: Optional[str] = None
         async with self.db.acquire() as conn:
             async with conn.transaction():
                 await self._ensure_device_exists(conn, device_id)
@@ -486,46 +508,116 @@ class EviewEventManager:
                         f"Dedup: skipping duplicate {event_type} for device {device_id} "
                         f"(matches {existing} within {self.DEDUP_WINDOW_SECONDS}s)"
                     )
-                    return None
+                    # event_id stays None — parity row will record observation
+                    # without a foreign-id pointer, matching the TS side's
+                    # null-when-deduped behaviour.
+                else:
+                    event_id = _generate_cuid()
+                    await conn.execute('''
+                        INSERT INTO "EviewEvent"
+                        (id, "eviewDeviceId", "eventType", timestamp, "deviceName", "batteryLevel",
+                         lat, lng, "accuracyMeters", "isGps", "isWifi", "isGsm", "isMotion", "isCharging",
+                         "workMode", "signalStrength", "statusCode", "statusCode2", "alarmCode",
+                         "alarmCodeExtend", "buttonType", "rawPayload", "processedAt", "createdAt")
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                                $17, $18, $19, $20, $21, $22, $23, $23)
+                    ''',
+                        event_id,
+                        device_id,
+                        event_type,
+                        timestamp,
+                        headers.get('deviceName'),
+                        general_data.get('battery'),
+                        location_data.get('lat'),
+                        location_data.get('lng'),
+                        location_data.get('radius'),
+                        general_data.get('isGPS', False),
+                        general_data.get('isWIFI', False),
+                        general_data.get('isGSM', False),
+                        general_data.get('isMotion', False),
+                        general_data.get('isCharging', False),
+                        general_data.get('workMode'),
+                        general_data.get('signalSize'),
+                        general_data.get('statusCode'),
+                        general_data.get('statusCode2'),
+                        alarm_code,
+                        general_data.get('alarmCodeExtend'),
+                        button_type,
+                        json.dumps(event_data),
+                        now
+                    )
 
-                event_id = _generate_cuid()
+        # Parity write lives OUTSIDE the EviewEvent transaction so a
+        # WorkerParityCheck failure can never roll back the actual event
+        # save. Always record the observation — even when the canonical
+        # save was deduped against a row the TS subscriber wrote first,
+        # this Python instance still observed the event and needs to
+        # land a parity row so the comparator can pair it with the TS
+        # observation. Best-effort by design.
+        await self._record_parity_observation(
+            device_id=device_id,
+            event_type=event_type,
+            timestamp=timestamp,
+            general_data=general_data,
+            location_data=location_data,
+            alarm_code=alarm_code,
+            eview_event_id=event_id,
+        )
 
-                await conn.execute('''
-                    INSERT INTO "EviewEvent"
-                    (id, "eviewDeviceId", "eventType", timestamp, "deviceName", "batteryLevel",
-                     lat, lng, "accuracyMeters", "isGps", "isWifi", "isGsm", "isMotion", "isCharging",
-                     "workMode", "signalStrength", "statusCode", "statusCode2", "alarmCode",
-                     "alarmCodeExtend", "buttonType", "rawPayload", "processedAt", "createdAt")
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                            $17, $18, $19, $20, $21, $22, $23, $23)
-                ''',
-                    event_id,
-                    device_id,
-                    event_type,
-                    timestamp,
-                    headers.get('deviceName'),
-                    general_data.get('battery'),
-                    location_data.get('lat'),
-                    location_data.get('lng'),
-                    location_data.get('radius'),
-                    general_data.get('isGPS', False),
-                    general_data.get('isWIFI', False),
-                    general_data.get('isGSM', False),
-                    general_data.get('isMotion', False),
-                    general_data.get('isCharging', False),
-                    general_data.get('workMode'),
-                    general_data.get('signalSize'),
-                    general_data.get('statusCode'),
-                    general_data.get('statusCode2'),
-                    alarm_code,
-                    general_data.get('alarmCodeExtend'),
-                    button_type,
-                    json.dumps(event_data),
-                    now
-                )
+        if event_id is None:
+            return None
 
         logger.info(f"Saved Eview event {event_id} for device {device_id}: type={event_type}, button={button_type}")
         return event_id
+
+    async def _record_parity_observation(
+        self,
+        *,
+        device_id: str,
+        event_type: str,
+        timestamp: datetime.datetime,
+        general_data: Dict[str, Any],
+        location_data: Dict[str, Any],
+        alarm_code: Optional[int],
+        eview_event_id: Optional[str],
+    ) -> None:
+        """Mirror what the TS subscriber writes to WorkerParityCheck.
+
+        The Nucleus comparator diffs (deviceId, eventType, timestamp ±1s)
+        pairs across source='TS' / source='PYTHON' rows to score the
+        7-day parity gate. Runs on a fresh connection (not the EviewEvent
+        transaction's) so a parity-write failure stays isolated. All
+        exceptions are swallowed — best-effort by design.
+        """
+        try:
+            parity_id = _generate_cuid()
+            async with self.db.acquire() as conn:
+                await conn.execute(
+                    '''
+                    INSERT INTO "WorkerParityCheck"
+                        (id, source, "eviewDeviceId", "eventType", timestamp,
+                         "statusCode", "alarmCode", "batteryLevel", lat, lng,
+                         "eviewEventId", divergent, "observedAt")
+                    VALUES ($1, 'PYTHON', $2, $3, $4,
+                            $5, $6, $7, $8, $9,
+                            $10, false, $11)
+                    ''',
+                    parity_id,
+                    device_id,
+                    event_type,
+                    timestamp,
+                    general_data.get('statusCode'),
+                    alarm_code,
+                    general_data.get('battery'),
+                    location_data.get('lat'),
+                    location_data.get('lng'),
+                    eview_event_id,
+                    datetime.datetime.utcnow(),
+                )
+        except Exception as e:  # noqa: BLE001 — best-effort, never bubble
+            logger.warning(
+                f"Parity write failed (non-fatal) for {device_id}/{event_type}: {e}"
+            )
 
     async def get_latest_event(self, device_id: str) -> Optional[Dict[str, Any]]:
         """Get the latest event for a device."""

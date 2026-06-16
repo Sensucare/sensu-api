@@ -6,13 +6,33 @@ import asyncio
 import datetime
 import json
 import logging
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import requests
 
 from eview.mqtt_service import EviewMQTTService, init_mqtt_service
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_event_timestamp(data: Dict[str, Any]) -> datetime.datetime:
+    """Mirror the TS worker's timestamp handling so parity rows line up.
+
+    The Eview payload includes a unix-millis ``timestamp`` field on every
+    message. The TS subscriber uses that value directly; Python used to
+    fall back to ``datetime.now()`` which made TS/Python parity rows
+    differ by minutes (delayed processing) or hours (delayed devices),
+    blowing past the comparator's ±1s match window. Falls back to now()
+    only when the payload is missing or unparseable.
+    """
+    raw = data.get('timestamp') if isinstance(data, dict) else None
+    if isinstance(raw, (int, float)) and raw > 0:
+        # Eview emits milliseconds since epoch; fromtimestamp wants seconds.
+        try:
+            return datetime.datetime.utcfromtimestamp(raw / 1000.0)
+        except (OSError, ValueError, OverflowError):
+            pass
+    return datetime.datetime.utcnow()
 
 
 def create_mqtt_event_handlers(eview_event_manager, loop: asyncio.AbstractEventLoop, mqtt_service_ref=None):
@@ -149,7 +169,7 @@ def create_mqtt_event_handlers(eview_event_manager, loop: asyncio.AbstractEventL
                 event_id = await eview_event_manager.save_event(
                     device_id=device_id,
                     event_type=event_type,
-                    timestamp=datetime.datetime.now(),
+                    timestamp=_extract_event_timestamp(data),
                     event_data=data
                 )
                 if event_id:
@@ -181,7 +201,7 @@ def create_mqtt_event_handlers(eview_event_manager, loop: asyncio.AbstractEventL
                 event_id = await eview_event_manager.save_event(
                     device_id=device_id,
                     event_type=event_type,
-                    timestamp=datetime.datetime.now(),
+                    timestamp=_extract_event_timestamp(data),
                     event_data=data
                 )
                 if event_id:
@@ -208,7 +228,7 @@ def create_mqtt_event_handlers(eview_event_manager, loop: asyncio.AbstractEventL
                 event_id = await eview_event_manager.save_event(
                     device_id=device_id,
                     event_type='fall_detection',
-                    timestamp=datetime.datetime.now(),
+                    timestamp=_extract_event_timestamp(event_data.get('raw_payload', event_data)),
                     event_data=event_data.get('raw_payload', event_data)
                 )
                 if event_id:
@@ -232,7 +252,7 @@ def create_mqtt_event_handlers(eview_event_manager, loop: asyncio.AbstractEventL
                 event_id = await eview_event_manager.save_event(
                     device_id=device_id,
                     event_type='battery_low',
-                    timestamp=datetime.datetime.now(),
+                    timestamp=_extract_event_timestamp(event_data.get('raw_payload', event_data)),
                     event_data=event_data.get('raw_payload', event_data)
                 )
                 if event_id:
@@ -260,7 +280,7 @@ def create_mqtt_event_handlers(eview_event_manager, loop: asyncio.AbstractEventL
                 event_id = await eview_event_manager.save_event(
                     device_id=device_id,
                     event_type=event_type,
-                    timestamp=datetime.datetime.now(),
+                    timestamp=_extract_event_timestamp(event_data.get('raw_payload', event_data)),
                     event_data=event_data.get('raw_payload', event_data)
                 )
                 if event_id:
