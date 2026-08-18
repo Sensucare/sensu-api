@@ -8,8 +8,6 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
-import requests
-
 from eview.mqtt_service import EviewMQTTService, init_mqtt_service
 
 logger = logging.getLogger(__name__)
@@ -82,75 +80,21 @@ def create_mqtt_event_handlers(eview_event_manager, loop: asyncio.AbstractEventL
         _increment_failed()
         return False
 
-    EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
-
-    ALERT_NOTIFICATIONS = {
-        "sos": {"title": "Alerta SOS", "body": "Se activó la alerta SOS en el dispositivo"},
-        "fall_detection": {"title": "Caída detectada", "body": "Se detectó una posible caída"},
-        "battery_low": {"title": "Batería baja", "body": "La batería del dispositivo está baja ({battery}%)"},
-        "geofence_exit": {"title": "Geocerca", "body": "El dispositivo salió de la zona segura"},
-        "geofence_enter": {"title": "Geocerca", "body": "El dispositivo entró a la zona"},
-    }
-
-    async def _get_push_tokens_for_device(device_id: str):
-        """Get push tokens for all users linked to a device."""
-        from core.database import DatabaseManager, DATABASE_URL
-        db = DatabaseManager(DATABASE_URL)
-        try:
-            await db.init_pool()
-            rows = await db.fetch('''
-                SELECT u."expoPushToken"
-                FROM "User" u
-                JOIN "UserDevice" ud ON u.id = ud."userId"
-                WHERE ud."eviewDeviceId" = $1
-                AND u."expoPushToken" IS NOT NULL
-            ''', device_id)
-            return [row["expoPushToken"] for row in rows]
-        except Exception as e:
-            logger.error(f"Failed to query push tokens for device {device_id}: {e}")
-            return []
-        finally:
-            await db.close()
-
-    def _send_push_notification(device_id: str, event_type: str, extra_data: Optional[Dict] = None):
-        """Send push notification to all users linked to a device."""
-        notif = ALERT_NOTIFICATIONS.get(event_type)
-        if not notif:
-            return
-
-        async def _send():
-            tokens = await _get_push_tokens_for_device(device_id)
-            if not tokens:
-                return
-
-            body = notif["body"]
-            if extra_data:
-                try:
-                    body = body.format(**extra_data)
-                except (KeyError, ValueError):
-                    pass
-
-            for token in tokens:
-                try:
-                    resp = requests.post(EXPO_PUSH_URL, json={
-                        "to": token,
-                        "title": notif["title"],
-                        "body": body,
-                        "sound": "default",
-                        "priority": "high",
-                        "data": {
-                            "type": event_type,
-                            "device_id": device_id,
-                        },
-                    }, timeout=10)
-                    if resp.status_code == 200:
-                        logger.info(f"Push notification sent for {event_type} to {token[:30]}...")
-                    else:
-                        logger.warning(f"Expo Push API error: {resp.status_code}")
-                except Exception as e:
-                    logger.warning(f"Failed to send push notification: {e}")
-
-        _run_async(_send(), context=f"push_notification:{event_type}:{device_id}")
+    # Push fan-out helpers (Juan 2026-06-25) moved into eview/push.py so
+    # the app-side SOS endpoint (eview/routes.py) can reuse the same
+    # logic — the MQTT closure here just calls into the module now.
+    def _send_push_notification(
+        device_id: str,
+        event_type: str,
+        extra_data: Optional[Dict] = None,
+    ) -> None:
+        from eview.push import send_push_notification_threadsafe
+        send_push_notification_threadsafe(
+            device_id,
+            event_type,
+            extra_data,
+            run_async=_run_async,
+        )
 
     def on_eview_event(device_id: str, event_type: str, data: Dict):
         """Handle incoming Eview events.

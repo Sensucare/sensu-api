@@ -3,11 +3,14 @@ import logging
 from typing import Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Depends
+from pydantic import BaseModel, Field
 
 from auth.core import get_current_user
+from core.database import _generate_cuid
 from eview.models import (
     DeviceAssociation, LinkDeviceRequest, EviewStatus, EviewEvent, EviewMQTTStatus,
 )
+from eview.push import send_push_notification
 
 logger = logging.getLogger(__name__)
 
@@ -400,3 +403,91 @@ async def get_eview_realtime(device_id: str, current_user: Dict = Depends(get_cu
     except Exception as e:
         logger.error(f"Error fetching EVMars realtime for {device_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch device status")
+
+
+# ==================== APP-SIDE SOS (2026-06-24) ====================
+#
+# Closes the Phase A gap where the React Native mobile app's red SOS
+# button only opened the dialer and never produced a server-side
+# record. Operators on /admin/operator now see a fresh EviewEvent the
+# moment the senior or a family member taps the button, even if the
+# cellular call never connects.
+#
+# Auth uses the mobile app's existing JWT (same `get_current_user`
+# guard every other route in this file uses), so the client just adds
+# a POST in parallel with `Linking.openURL('tel:...')`. The endpoint
+# verifies the caller is paired to the device before writing.
+#
+# Push notifications to family devices are NOT fired here yet — the
+# existing push helper lives inside an MQTT closure that this route
+# can't import cleanly. v1 covers the call-center-visibility leg
+# (the headline requirement); family-side Expo push can land as a
+# follow-up refactor once `_send_push_notification` is hoisted to
+# module scope.
+
+
+class AppSosRequest(BaseModel):
+    lat: Optional[float] = Field(default=None, ge=-90, le=90)
+    lng: Optional[float] = Field(default=None, ge=-180, le=180)
+    battery_level: Optional[int] = Field(default=None, ge=0, le=100)
+
+
+class AppSosResponse(BaseModel):
+    ok: bool
+    event_id: str
+
+
+@router.post(
+    "/api/devices/{device_id}/sos",
+    tags=["devices"],
+    summary="Record an app-side SOS press and surface it on the operator board",
+    response_model=AppSosResponse,
+)
+async def record_app_sos(
+    device_id: str,
+    body: AppSosRequest,
+    current_user: Dict = Depends(get_current_user),
+):
+    if not device_id or len(device_id) > 64:
+        raise HTTPException(status_code=400, detail="Invalid device id")
+
+    await _verify_device_access(device_id, current_user["user_id"])
+
+    now = datetime.datetime.utcnow()
+    event_id = _generate_cuid()
+    em = get_eview_event_manager()
+    async with em.db.acquire() as conn:
+        # Make sure the Device row exists — fresh pendants paired today
+        # may not have hit the MQTT path yet, and a missing FK target
+        # would 500 the insert.
+        await em._ensure_device_exists(conn, device_id)
+        await conn.execute(
+            '''
+            INSERT INTO "EviewEvent"
+                (id, "eviewDeviceId", "eventType", timestamp, "batteryLevel",
+                 lat, lng, "buttonType", "processedAt", "createdAt")
+            VALUES ($1, $2, 'sos', $3, $4, $5, $6, 'App SOS', $3, $3)
+            ''',
+            event_id,
+            device_id,
+            now,
+            body.battery_level,
+            body.lat,
+            body.lng,
+        )
+
+    logger.info(
+        f"App-side SOS recorded: device={device_id} user={current_user['user_id']} "
+        f"event={event_id} lat={body.lat} lng={body.lng}"
+    )
+
+    # Fan-out Expo push to every device paired to this IMEI so the
+    # senior's family phones light up alongside the call-center
+    # dashboard. Wrapped in try so a push failure (Expo down, no
+    # tokens) never poisons the OK response.
+    try:
+        await send_push_notification(device_id, "sos")
+    except Exception as e:  # pragma: no cover — defensive
+        logger.warning(f"App SOS push fan-out failed for {device_id}: {e}")
+
+    return AppSosResponse(ok=True, event_id=event_id)
