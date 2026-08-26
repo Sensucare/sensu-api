@@ -581,43 +581,12 @@ class EviewEventManager:
         alarm_code: Optional[int],
         eview_event_id: Optional[str],
     ) -> None:
-        """Mirror what the TS subscriber writes to WorkerParityCheck.
-
-        The Nucleus comparator diffs (deviceId, eventType, timestamp ±1s)
-        pairs across source='TS' / source='PYTHON' rows to score the
-        7-day parity gate. Runs on a fresh connection (not the EviewEvent
-        transaction's) so a parity-write failure stays isolated. All
-        exceptions are swallowed — best-effort by design.
-        """
-        try:
-            parity_id = _generate_cuid()
-            async with self.db.acquire() as conn:
-                await conn.execute(
-                    '''
-                    INSERT INTO "WorkerParityCheck"
-                        (id, source, "eviewDeviceId", "eventType", timestamp,
-                         "statusCode", "alarmCode", "batteryLevel", lat, lng,
-                         "eviewEventId", divergent, "observedAt")
-                    VALUES ($1, 'PYTHON', $2, $3, $4,
-                            $5, $6, $7, $8, $9,
-                            $10, false, $11)
-                    ''',
-                    parity_id,
-                    device_id,
-                    event_type,
-                    timestamp,
-                    general_data.get('statusCode'),
-                    alarm_code,
-                    general_data.get('battery'),
-                    location_data.get('lat'),
-                    location_data.get('lng'),
-                    eview_event_id,
-                    datetime.datetime.utcnow(),
-                )
-        except Exception as e:  # noqa: BLE001 — best-effort, never bubble
-            logger.warning(
-                f"Parity write failed (non-fatal) for {device_id}/{event_type}: {e}"
-            )
+        """Retired 2026-08-26. Phase A parity closed with 0 divergences
+        across 3.5 months of observation; kept writing rows anyway
+        ballooned WorkerParityCheck to 518k rows and 161 MB. Function
+        is now a no-op — caller signature preserved so save_eview_event
+        does not need edits. Table has been truncated on the DB side."""
+        return
 
     async def get_latest_event(self, device_id: str) -> Optional[Dict[str, Any]]:
         """Get the latest event for a device."""
